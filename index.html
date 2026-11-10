@@ -119,6 +119,8 @@
   .fm.bad { background: var(--bad-mark); color: var(--bad-on); }
   .fm.sel { outline: 3px solid #13263b; outline-offset: 2px; }
   .fm.bad::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--bad-mark); opacity: .5; animation: pulse 2.2s ease-out infinite; pointer-events: none; }
+  .fm.stale { filter: grayscale(1); opacity: .58; }
+  .mk.stale { background: var(--surface-2); color: var(--muted); }
   @keyframes pulse { 0% { transform: scale(.85); opacity: .6; } 100% { transform: scale(1.7); opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { .fm.bad::after { animation: none; } }
   .pin-a { width: 30px; height: 30px; border-radius: 50%; background: #1769aa; color: #fff; display: grid; place-items: center; font: 700 12px var(--font); border: 2.5px solid #fff; box-shadow: 0 2px 7px #0a1a2a66; }
@@ -306,16 +308,25 @@
       Tân Phong, Quận 7". Nếu lệch, bấm vào ghim trường trên bản đồ,
       chọn "Đặt lại vị trí trường" rồi chạm đúng chỗ (lưu trong trình duyệt),
       hoặc sửa số ở SCHOOL_DEFAULT.
-   2) Firebase (không bắt buộc): tạo project tại console.firebase.google.com,
-      bật Firestore Database, thêm Web app, rồi dán firebaseConfig vào
-      FIREBASE_CONFIG. Dữ liệu nằm ở collection "floods" với các trường:
-      name, level (số, cm), lat, lng, note, createdAt (timestamp).
-      Để thử nghiệm, rules cần cho phép đọc/ghi collection này; khi dùng thật
-      phải siết rules lại (ví dụ yêu cầu đăng nhập), vì ai cũng ghi được
-      sẽ có thể bị báo ngập giả.
+   2) Firebase Realtime Database: cảm biến FS001 được đọc từ
+      /sensors/FS001 với waterLevelCm, distanceCm và timestamp (Unix ms).
+      Không bật quyền ghi công khai; chỉ cấp quyền đọc phù hợp cho website
+      và xác thực thiết bị gửi dữ liệu.
    ===================================================================== */
 var SCHOOL_DEFAULT = { name: 'Trường THCS và THPT Đinh Thiện Lý', addr: '80 Nguyễn Đức Cảnh, Tân Phong, Quận 7', lng: 106.7075, lat: 10.7262 };
-var FIREBASE_CONFIG = null; /* ví dụ: { apiKey: "...", authDomain: "...", projectId: "...", appId: "..." } */
+var FIREBASE_CONFIG = {
+  apiKey: "AIzaSyA0vIifmP_ejAlS-0etixMmSkJMZb-7gyg",
+  authDomain: "featflooddetector.firebaseapp.com",
+  databaseURL: "https://featflooddetector-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "featflooddetector",
+  storageBucket: "featflooddetector.firebasestorage.app",
+  messagingSenderId: "563094243343",
+  appId: "1:563094243343:web:79452f0a23a3decbe8bb7a",
+  measurementId: "G-3V583SXQ7K"
+};
+var SENSOR_ID = "FS001";
+var SENSOR_LOCATION = { lng: 106.726712, lat: 10.728872 };
+var DATABASE_URL = "https://featflooddetector-default-rtdb.asia-southeast1.firebasedatabase.app";
 var MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 var OSRM = 'https://router.project-osrm.org';
 var FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/10.14.1/';
@@ -326,6 +337,7 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
   var LABELS = { ok: 'Bình thường', warn: 'Cần chú ý', bad: 'Nguy hiểm' };
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function statusOf(l) { return l <= 10 ? 'ok' : l <= 30 ? 'warn' : 'bad'; }
+  function sensorIsStale(f) { return !!(f && f.sensor && Date.now() - f.ts > 45 * 60 * 1000); }
   function fmtKm(m) { return (m / 1000).toFixed(1).replace('.', ','); }
   function ago(ts) {
     var m = Math.max(0, Math.round((Date.now() - ts) / 60000));
@@ -379,11 +391,12 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
     { name: 'Gò Vấp', lng: 106.6650, lat: 10.8380 }
   ];
 
-  var remote = null;       // mảng điểm ngập từ Firebase, null nếu chưa dùng
+  var remote = null;       // báo cáo cộng đồng từ Firestore (nếu được cấu hình riêng)
+  var sensorFlood = null;  // số đo mới nhất từ Realtime Database
   var floods = [];
   function buildFloods() {
-    if (remote) { floods = remote.slice(); return; }
-    floods = store.user.concat(SEED.filter(function (s) { return store.removed.indexOf(s.id) < 0; }));
+    var base = remote ? remote.slice() : store.user.concat(SEED.filter(function (s) { return store.removed.indexOf(s.id) < 0; }));
+    floods = sensorFlood ? base.concat([sensorFlood]) : base;
   }
 
   /* ---------- hình học ---------- */
@@ -402,7 +415,7 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
   function evalRoute(c) {
     var danger = [], warn = [];
     floods.forEach(function (f) {
-      if (f.level <= 10) return;
+      if (sensorIsStale(f) || f.level <= 10) return;
       if (distToLine(f, c.coords) <= HIT_RADIUS_M) (f.level > 30 ? danger : warn).push(f);
     });
     return { c: c, danger: danger, warn: warn, dur: c.dur, dist: c.dist };
@@ -504,10 +517,10 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
     if (!map) return;
     floodMarkers.forEach(function (m) { m.remove(); }); floodMarkers = [];
     floods.forEach(function (f) {
-      var st = statusOf(f.level);
-      var d = el('fm ' + st + (sel && sel.kind === 'flood' && sel.id === f.id ? ' sel' : ''), String(f.level));
+      var st = statusOf(f.level), stale = sensorIsStale(f);
+      var d = el('fm ' + st + (stale ? ' stale' : '') + (sel && sel.kind === 'flood' && sel.id === f.id ? ' sel' : ''), String(f.level));
       d.setAttribute('role', 'button'); d.setAttribute('tabindex', '0');
-      d.setAttribute('aria-label', f.name + ', ' + f.level + ' cm, ' + LABELS[st]);
+      d.setAttribute('aria-label', f.name + ', ' + f.level + ' cm, ' + (stale ? 'dữ liệu cũ' : LABELS[st]));
       d.addEventListener('click', function (ev) { ev.stopPropagation(); if (!pick) select('flood', f.id, false); });
       d.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); select('flood', f.id, false); } });
       floodMarkers.push(new maplibregl.Marker({ element: d }).setLngLat([f.lng, f.lat]).addTo(map));
@@ -523,23 +536,28 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
   /* ---------- hiển thị bên cạnh ---------- */
   var sel = null;
   function renderSummary() {
-    var c = { ok: 0, warn: 0, bad: 0 };
-    floods.forEach(function (f) { c[statusOf(f.level)]++; });
+    var c = { ok: 0, warn: 0, bad: 0, stale: 0 };
+    floods.forEach(function (f) {
+      if (sensorIsStale(f)) c.stale++;
+      else c[statusOf(f.level)]++;
+    });
     $('#summary').innerHTML =
       '<span class="chip"><span class="dot"></span><b>' + floods.length + '</b> điểm theo dõi</span>' +
       '<span class="chip"><span class="dot ok"></span><b>' + c.ok + '</b> bình thường</span>' +
       '<span class="chip"><span class="dot warn"></span><b>' + c.warn + '</b> cần chú ý</span>' +
-      '<span class="chip"><span class="dot bad"></span><b>' + c.bad + '</b> nguy hiểm</span>';
+      '<span class="chip"><span class="dot bad"></span><b>' + c.bad + '</b> nguy hiểm</span>' +
+      (c.stale ? '<span class="chip"><span class="dot warn"></span><b>' + c.stale + '</b> cảm biến có dữ liệu cũ</span>' : '');
   }
   function renderList() {
     var box = $('#floodList');
     if (!floods.length) { box.innerHTML = '<p class="empty">Chưa có điểm ngập nào. Hãy gửi báo cáo ở tab “Báo cáo ngập”.</p>'; return; }
     box.innerHTML = floods.slice().sort(function (a, b) { return b.level - a.level; }).map(function (f) {
       var st = statusOf(f.level);
+      var stale = sensorIsStale(f);
       return '<button class="fl' + (sel && sel.kind === 'flood' && sel.id === f.id ? ' sel' : '') + '" type="button" data-fid="' + esc(f.id) + '">'
-        + '<span class="mk ' + st + '">' + f.level + '</span>'
-        + '<span><b>' + esc(f.name) + '</b><small>' + ago(f.ts) + (f.user ? ' · báo cáo' : ' · mẫu') + '</small></span>'
-        + '<span class="badge b-' + st + '">' + LABELS[st] + '</span></button>';
+        + '<span class="mk ' + (stale ? 'stale' : st) + '">' + f.level + '</span>'
+        + '<span><b>' + esc(f.name) + '</b><small>' + ago(f.ts) + (f.sensor ? ' · cảm biến ' + SENSOR_ID : (f.user ? ' · báo cáo' : ' · mẫu')) + (stale ? ' · dữ liệu cũ' : '') + '</small></span>'
+        + '<span class="badge ' + (stale ? 'b-warn' : 'b-' + st) + '">' + (stale ? 'Dữ liệu cũ' : LABELS[st]) + '</span></button>';
     }).join('');
   }
   function renderCard() {
@@ -548,12 +566,12 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
     if (sel.kind === 'flood') {
       var f = floods.filter(function (x) { return x.id === sel.id; })[0];
       if (!f) { sel = null; c.hidden = true; return; }
-      var st = statusOf(f.level);
+      var st = statusOf(f.level), stale = sensorIsStale(f);
       c.innerHTML = '<button class="x" type="button" data-act="close" aria-label="Đóng">×</button>'
-        + '<h4>' + esc(f.name) + '</h4><div class="sub">' + ago(f.ts) + (f.user ? ' · báo cáo do người dùng gửi' : ' · dữ liệu mẫu') + '</div>'
-        + '<div class="row"><span class="big">' + f.level + ' cm</span><span class="badge b-' + st + '">' + LABELS[st] + '</span></div>'
+        + '<h4>' + esc(f.name) + '</h4><div class="sub">' + ago(f.ts) + (f.sensor ? ' · cảm biến ' + SENSOR_ID : (f.user ? ' · báo cáo do người dùng gửi' : ' · dữ liệu mẫu')) + '</div>'
+        + '<div class="row"><span class="big">' + f.level + ' cm</span><span class="badge ' + (stale ? 'b-warn' : 'b-' + st) + '">' + (stale ? 'Dữ liệu cũ' : LABELS[st]) + '</span></div>'
         + (f.note ? '<div class="sub" style="margin-top:6px">' + esc(f.note) + '</div>' : '')
-        + '<div class="acts"><button class="btn danger-quiet sm" type="button" data-act="remove">Đã hết ngập, xóa điểm</button></div>';
+        + (f.sensor ? '<div class="sub" style="margin-top:6px">Vị trí cảm biến: ' + SENSOR_LOCATION.lat.toFixed(6) + ', ' + SENSOR_LOCATION.lng.toFixed(6) + '</div>' : '<div class="acts"><button class="btn danger-quiet sm" type="button" data-act="remove">Đã hết ngập, xóa điểm</button></div>');
     } else {
       c.innerHTML = '<button class="x" type="button" data-act="close" aria-label="Đóng">×</button>'
         + '<h4>' + esc(school.name) + '</h4><div class="sub">' + esc(school.addr) + '</div>'
@@ -791,25 +809,54 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
     showTab(next); $('#t-' + next).focus();
   });
 
-  /* ---------- Firebase (tùy chọn) ---------- */
-  var fb = null;
+  /* ---------- Firebase Realtime Database: cảm biến FS001 ---------- */
+  var fb = null; // Firestore chưa được bật; báo cáo thủ công vẫn lưu cục bộ
   function setSrc(kind, text) { var p = $('#srcPill'); p.className = 'pill' + (kind ? ' ' + kind : ''); $('#srcText').textContent = text; }
   function initFirebase() {
-    if (!FIREBASE_CONFIG) return;
+    if (!FIREBASE_CONFIG || !DATABASE_URL) return;
     setSrc('', 'Đang kết nối Firebase…');
-    Promise.all([import(FIREBASE_SDK + 'firebase-app.js'), import(FIREBASE_SDK + 'firebase-firestore.js')]).then(function (m) {
-      var app = m[0].initializeApp(FIREBASE_CONFIG), db = m[1].getFirestore(app);
-      fb = { db: db, collection: m[1].collection, addDoc: m[1].addDoc, deleteDoc: m[1].deleteDoc, doc: m[1].doc, serverTimestamp: m[1].serverTimestamp };
-      m[1].onSnapshot(m[1].collection(db, 'floods'), function (snap) {
-        remote = snap.docs.map(function (d) {
-          var x = d.data();
-          return { id: d.id, name: x.name || 'Điểm ngập', level: Number(x.level) || 0, lat: Number(x.lat), lng: Number(x.lng), note: x.note || '', ts: x.createdAt && x.createdAt.toMillis ? x.createdAt.toMillis() : Date.now(), user: true };
-        }).filter(validPt);
-        setSrc('live', 'Firebase · trực tuyến');
-        $('#notice').textContent = 'Đang hiển thị dữ liệu từ Firebase. Bản đồ: OpenFreeMap + MapLibre GL JS. Định tuyến dùng máy chủ demo OSRM công cộng, chỉ phù hợp để thử nghiệm.';
+    Promise.all([import(FIREBASE_SDK + 'firebase-app.js'), import(FIREBASE_SDK + 'firebase-database.js')]).then(function (m) {
+      var app = m[0].initializeApp(FIREBASE_CONFIG);
+      var db = m[1].getDatabase(app, DATABASE_URL);
+      m[1].onValue(m[1].ref(db, 'sensors/' + SENSOR_ID), function (snap) {
+        var x = snap.val();
+        if (x && typeof x === 'object') {
+          var level = Number(x.waterLevelCm != null ? x.waterLevelCm : x.waterLevel);
+          var ts = Number(x.timestamp || x.updatedAt || 0);
+          if (ts > 0 && ts < 1000000000000) ts *= 1000;
+          if (!ts) ts = Date.now();
+          if (isFinite(level) && level >= 0 && level <= 500) {
+            var distance = Number(x.distanceCm);
+            sensorFlood = {
+              id: 'sensor-' + SENSOR_ID,
+              name: 'Flood Stick ' + SENSOR_ID,
+              level: level,
+              lng: SENSOR_LOCATION.lng,
+              lat: SENSOR_LOCATION.lat,
+              note: isFinite(distance) && distance > 0 ? 'Khoảng cách cảm biến tới mặt nước: ' + distance.toFixed(1) + ' cm.' : 'Số đo do cảm biến gửi lên.',
+              ts: ts,
+              user: false,
+              sensor: true
+            };
+          } else sensorFlood = null;
+        } else sensorFlood = null;
+        setSrc('live', sensorFlood ? 'Firebase · cảm biến ' + SENSOR_ID : 'Firebase · chờ cảm biến');
+        $('#notice').textContent = sensorFlood
+          ? 'Đang hiển thị số đo từ Flood Stick ' + SENSOR_ID + '. Các điểm khác có thể vẫn là dữ liệu mẫu hoặc báo cáo cộng đồng.'
+          : 'Đã kết nối Firebase Realtime Database. Đang chờ số đo đầu tiên từ Flood Stick ' + SENSOR_ID + '; các điểm khác vẫn là dữ liệu mẫu.';
         buildFloods(); renderAll();
-      }, function () { remote = null; fb = null; setSrc('err', 'Firebase lỗi · dùng dữ liệu mẫu'); buildFloods(); renderAll(); });
-    }).catch(function () { remote = null; fb = null; setSrc('err', 'Firebase lỗi · dùng dữ liệu mẫu'); });
+      }, function () {
+        sensorFlood = null;
+        setSrc('err', 'Firebase · chưa có quyền đọc');
+        $('#notice').textContent = 'Không đọc được Realtime Database. Kiểm tra quyền đọc tại /sensors/' + SENSOR_ID + ' trong Firebase Rules.';
+        buildFloods(); renderAll();
+      });
+    }).catch(function () {
+      sensorFlood = null;
+      setSrc('err', 'Firebase · lỗi kết nối');
+      $('#notice').textContent = 'Không thể khởi tạo Firebase. Kiểm tra cấu hình Web app và kết nối Internet.';
+      buildFloods(); renderAll();
+    });
   }
 
   /* ---------- khởi động ---------- */
