@@ -824,7 +824,6 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
           var level = Number(x.waterLevelCm != null ? x.waterLevelCm : x.waterLevel);
           var ts = Number(x.timestamp || x.updatedAt || 0);
           if (ts > 0 && ts < 1000000000000) ts *= 1000;
-          if (!ts) ts = Date.now();
           if (isFinite(level) && level >= 0 && level <= 500) {
             var distance = Number(x.distanceCm);
             sensorFlood = {
@@ -861,6 +860,9 @@ var HIT_RADIUS_M = 80; /* điểm ngập trong phạm vi này quanh tuyến đư
 
   /* ---------- khởi động ---------- */
   buildFloods(); renderAll(); initFirebase();
+  window.setInterval(function () {
+    if (sensorFlood) { buildFloods(); renderAll(); }
+  }, 60000);
   window.__safeRoute = { choose: choose, evalRoute: evalRoute, distToLine: distToLine, setFloods: function (f) { floods = f; }, getFloods: function () { return floods; } };
 })();
 </script>
